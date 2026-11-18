@@ -88,45 +88,36 @@ def flat_ints(node):
     if isinstance(node,dict):  return [x for v in node.values() for x in flat_ints(v)]
     return []
 
-def find_zone(node, zone):
-    if isinstance(node,dict):
-        for k in ("PWMIndex","Index","Zone","zone","index"):
-            if k in node:
-                try:
-                    if int(node[k])==zone: return node
-                except (TypeError,ValueError): pass
-        for v in node.values():
-            r=find_zone(v,zone)
-            if r is not None: return r
-    elif isinstance(node,list):
-        for v in node:
-            r=find_zone(v,zone)
-            if r is not None: return r
-    return None
-
-# Returns (duty|None, raw_text). Tolerant parser: GET /api/fanctrl/PWM reply shape
-# is undocumented, so we hunt for the zone's PWM table and take its last duty value.
+# GET /api/fanctrl/PWM replies with a positional list of zone objects:
+# [ { "PWMName": "Zone1(...)", "PWMSrc": 0, "CurrentPWMdata": [ {"index":0,"Temp":0,"Duty":20}, ... ] }, ... ]
+# Returns (duty|None, raw_text); tolerant to alt shapes, never raises on bad data.
 def get_duty():
     txt=bmc("GET","/api/fanctrl/PWM")
     d=json.loads(txt)
     if isinstance(d,dict) and "cc" in d and d["cc"]!=0: raise RuntimeError("bmc cc=%s"%d["cc"])
-    for key in ("PWMdata","zones","PWM","Data"):
-        if isinstance(d,dict) and key in d: d=d[key]; break
-    z=find_zone(d,ZONE)
-    cands=[]
-    def look(n):
-        if isinstance(n,dict):
-            for k in ("CurrentPWMdata","PWMdata","CurrentPWM","PWM","Duty"):
-                if k in n and isinstance(n[k],list):
-                    ints=flat_ints(n[k])
-                    if ints: cands.append(ints)
-            for v in n.values(): look(v)
-        elif isinstance(n,list):
-            for v in n: look(v)
-    look(z if z is not None else d)
-    if z is None and len(cands)!=1: return None,txt
-    if not cands: return None,txt
-    duty=cands[0][-1]
+    zones=d
+    if isinstance(d,dict):
+        for key in ("PWMdata","zones","PWM","Data"):
+            if key in d: zones=d[key]; break
+    if isinstance(zones,list):
+        if len(zones)<=ZONE: return None,txt
+        z=zones[ZONE]
+    elif isinstance(zones,dict): z=zones
+    else: return None,txt
+    tbl=None
+    if isinstance(z,dict):
+        for k in ("CurrentPWMdata","PWMdata","CurrentPWM"):
+            if k in z: tbl=z[k]; break
+    elif isinstance(z,list): tbl=z
+    if not isinstance(tbl,list) or not tbl: return None,txt
+    if all(isinstance(x,dict) for x in tbl):
+        ds=[x["Duty"] for x in tbl if str(x.get("Duty","")).lstrip("-").isdigit()]
+        if not ds: return None,txt
+        duty=int(ds[-1])
+    else:
+        ints=flat_ints(tbl)
+        if not ints: return None,txt
+        duty=ints[-1]
     return (duty if 0<=duty<=100 else None), txt
 
 current=None; first=True; consec_bad=0; stopped=False; next_sync=time.time()+SYNC_S; raw_dumped=False
