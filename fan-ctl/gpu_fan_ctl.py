@@ -78,7 +78,7 @@ def set_duty(duty):
     bmc("PUT","/api/fanctrl/PWM",payload,ct="json")
     return d
 
-current=MIN_DUTY; consec_bad=0; stopped=False
+current=None; first=True; consec_bad=0; stopped=False
 def handle(sig,frm):
     global stopped; stopped=True
 signal.signal(signal.SIGINT,handle); signal.signal(signal.SIGTERM,handle)
@@ -96,12 +96,13 @@ while not stopped:
         ts,vrams=read_gpu(); consec_bad=0
         mv=max(vrams)
         target=int(max(MIN_DUTY,min(MAX_DUTY,round(interp(VRAM_CURVE,mv)))))
-        if abs(target-current)<=DEADBAND:
-            desired=current
-        elif target>current:
-            desired=min(target,current+RATE_UP)
+        base=current if current is not None else MIN_DUTY
+        if abs(target-base)<=DEADBAND:
+            desired=base
+        elif target>base:
+            desired=min(target,base+RATE_UP)
         else:
-            desired=max(target,current-RATE_DN)
+            desired=max(target,base-RATE_DN)
         status="ok"
     except Exception as e:
         consec_bad+=1
@@ -110,17 +111,17 @@ while not stopped:
         else:
             desired=current; status="warn(%s)"%e
         mv=None
-    if desired!=current:
+    if desired is not None and (desired!=current or first):
         if APPLY:
             try:
                 if consec_bad and desired==FAIL_DUTY: login()
-                current=set_duty(desired)
+                current=set_duty(desired); first=False
             except Exception as e:
-                try: login(); current=set_duty(desired)
-                except Exception as e2: log("WRITE-FAIL %s (keeping duty=%d)"%(e2,current))
+                try: login(); current=set_duty(desired); first=False
+                except Exception as e2: log("WRITE-FAIL %s (keeping duty=%d)"%(e2,current if current is not None else desired))
         else:
-            current=desired
-    log("maxVRAM=%s duty=%d%s [%s]"%(mv,current,"(DRY)" if not APPLY else "",status))
+            current=desired; first=False
+    log("maxVRAM=%s duty=%d%s [%s]"%(mv,current if current is not None else (desired if desired is not None else MIN_DUTY),"(DRY)" if not APPLY else "",status))
     if ITERS:
         ITERS-=1
         if ITERS<=0: break
@@ -131,7 +132,7 @@ if APPLY:
         if ON_EXIT=="high":
             login(); set_duty(FAIL_DUTY); log("on-exit set duty=%d (high/failsafe)"%FAIL_DUTY)
         else:
-            log("on-exit kept duty=%d"%current)
+            log("on-exit kept duty=%d"%(current if current is not None else MIN_DUTY))
     except Exception as e:
         log("on-exit write failed: %s"%e)
 else:
