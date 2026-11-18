@@ -19,6 +19,16 @@ Default curve (GDDR6X on RTX 3090): `<=60C -> 30%`, `70C -> 50%`, `>=80C -> 100%
 Actuation uses the BMC web API: `POST /api/session` (login) then
 `PUT /api/fanctrl/PWM` to set the zone's PWM curve. Only the chassis zone is written.
 
+### State sync (read-back)
+The controller never trusts that a previous command is still in effect:
+- On start it **forces one write** so its internal duty matches the BMC (the BMC
+  may hold a stale value from an earlier run's fail-safe).
+- Every `SYNC_S` seconds it reads the commanded duty back with
+  `GET /api/fanctrl/PWM`. If it differs from the internal duty by more than
+  `SYNC_TOL`, it re-asserts its value and logs `DRIFT`. Read failures are logged
+  but deliberately **do not** trigger the fail-safe (a flaky read API must not
+  slam the fans to 100%). Set `SYNC_S=0` to disable.
+
 ### Safety
 The BMC has **no GPU-aware automatic mode to fall back to**, so the controller
 fails safe **HIGH**:

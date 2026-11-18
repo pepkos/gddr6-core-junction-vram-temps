@@ -21,6 +21,8 @@ DEADBAND= int(os.environ.get("DEADBAND", "2"))       # hold if within +-2%
 STALE_S = float(os.environ.get("STALE_S", "5"))      # max age of telemetry
 MIN_GPUS= int(os.environ.get("MIN_GPUS", "1"))
 ON_EXIT = os.environ.get("ON_EXIT", "high")          # high|keep on clean exit
+SYNC_S  = float(os.environ.get("SYNC_S", "30"))      # BMC read-back interval (0=off)
+SYNC_TOL= int(os.environ.get("SYNC_TOL", "2"))       # |bmc-internal| above this = drift
 APPLY   = "--apply" in sys.argv
 ITERS   = 0
 if "--iterations" in sys.argv:
@@ -78,7 +80,56 @@ def set_duty(duty):
     bmc("PUT","/api/fanctrl/PWM",payload,ct="json")
     return d
 
-current=None; first=True; consec_bad=0; stopped=False
+def flat_ints(node):
+    if isinstance(node,(str,int,float)):
+        try: return [int(float(node))]
+        except ValueError: return []
+    if isinstance(node,list):  return [x for v in node for x in flat_ints(v)]
+    if isinstance(node,dict):  return [x for v in node.values() for x in flat_ints(v)]
+    return []
+
+def find_zone(node, zone):
+    if isinstance(node,dict):
+        for k in ("PWMIndex","Index","Zone","zone","index"):
+            if k in node:
+                try:
+                    if int(node[k])==zone: return node
+                except (TypeError,ValueError): pass
+        for v in node.values():
+            r=find_zone(v,zone)
+            if r is not None: return r
+    elif isinstance(node,list):
+        for v in node:
+            r=find_zone(v,zone)
+            if r is not None: return r
+    return None
+
+# Returns (duty|None, raw_text). Tolerant parser: GET /api/fanctrl/PWM reply shape
+# is undocumented, so we hunt for the zone's PWM table and take its last duty value.
+def get_duty():
+    txt=bmc("GET","/api/fanctrl/PWM")
+    d=json.loads(txt)
+    if isinstance(d,dict) and "cc" in d and d["cc"]!=0: raise RuntimeError("bmc cc=%s"%d["cc"])
+    for key in ("PWMdata","zones","PWM","Data"):
+        if isinstance(d,dict) and key in d: d=d[key]; break
+    z=find_zone(d,ZONE)
+    cands=[]
+    def look(n):
+        if isinstance(n,dict):
+            for k in ("CurrentPWMdata","PWMdata","CurrentPWM","PWM","Duty"):
+                if k in n and isinstance(n[k],list):
+                    ints=flat_ints(n[k])
+                    if ints: cands.append(ints)
+            for v in n.values(): look(v)
+        elif isinstance(n,list):
+            for v in n: look(v)
+    look(z if z is not None else d)
+    if z is None and len(cands)!=1: return None,txt
+    if not cands: return None,txt
+    duty=cands[0][-1]
+    return (duty if 0<=duty<=100 else None), txt
+
+current=None; first=True; consec_bad=0; stopped=False; next_sync=time.time()+SYNC_S; raw_dumped=False
 def handle(sig,frm):
     global stopped; stopped=True
 signal.signal(signal.SIGINT,handle); signal.signal(signal.SIGTERM,handle)
@@ -88,7 +139,7 @@ if USER is None or PASS is None:
 login()
 
 def log(msg): print(time.strftime("%H:%M:%S"), msg, flush=True)
-log(f"controller start zone={ZONE} apply={APPLY} min={MIN_DUTY} max={MAX_DUTY} fail={FAIL_DUTY} interval={INTERVAL}s curve={VRAM_CURVE}")
+log(f"controller start zone={ZONE} apply={APPLY} min={MIN_DUTY} max={MAX_DUTY} fail={FAIL_DUTY} interval={INTERVAL}s sync={SYNC_S}s curve={VRAM_CURVE}")
 
 while not stopped:
     cycle_start=time.time()
@@ -122,6 +173,25 @@ while not stopped:
         else:
             current=desired; first=False
     log("maxVRAM=%s duty=%d%s [%s]"%(mv,current if current is not None else (desired if desired is not None else MIN_DUTY),"(DRY)" if not APPLY else "",status))
+    if APPLY and SYNC_S>0 and current is not None and time.time()>=next_sync:
+        next_sync=time.time()+SYNC_S
+        try:
+            real,txt=get_duty()
+        except Exception as e:
+            try: login(); real,txt=get_duty()
+            except Exception as e2: real=None; txt=str(e2)
+        if not raw_dumped and txt:
+            raw_dumped=True; log("SYNC raw: %s"%txt[:300].replace("\n"," "))
+        if real is None:
+            log("SYNC read-fail (keeping duty=%d, NOT failsafe)"%current)
+        elif abs(real-current)>SYNC_TOL:
+            log("DRIFT bmc=%d want=%d -> rewrite"%(real,current))
+            try: set_duty(current)
+            except Exception as e:
+                try: login(); set_duty(current); log("DRIFT rewrote after re-login")
+                except Exception as e2: log("DRIFT-REWRITE-FAIL %s"%e2)
+        else:
+            log("SYNC ok bmc=%d duty=%d"%(real,current))
     if ITERS:
         ITERS-=1
         if ITERS<=0: break
